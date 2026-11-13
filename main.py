@@ -17,7 +17,7 @@ SQRT_STEPS = tuple(math.sqrt(step) for step in STEPS)
 VOL_FLOOR = 0.00015
 WEIGHT_HALF_LIFE = 720.0
 REGIME_HALF_LIFE = 0.5
-SUMREV_KAPPA = 0.0
+SUMREV_KAPPA = 0.05
 RECENCY_WEIGHTS = tuple(math.exp2(-age / WEIGHT_HALF_LIFE)
                         for age in range(4320))
 MEDIAN_SCALES = {
