@@ -17,21 +17,49 @@ SQRT_STEPS = tuple(math.sqrt(step) for step in STEPS)
 VOL_FLOOR = 0.00015
 WEIGHT_HALF_LIFE = 720.0
 REGIME_HALF_LIFE = 0.5
-SUMREV_KAPPA = 0.05
+SUMREV_KAPPA = 0.07
 RECENCY_WEIGHTS = tuple(math.exp2(-age / WEIGHT_HALF_LIFE)
                         for age in range(4320))
 MEDIAN_SCALES = {
-    "Bill Dally": 1.2,
-    "Colette Kress": 0.85,
-    "Debora Shoquist": 1.2,
+    "Bill Dally": 0.78,
+    "Colette Kress": 0.78,
+    "Debora Shoquist": 0.97,
     "Ian Buck": 1.25,
-    "Jay Puri": 1.1,
-    "Madison Huang": 1.25,
-    "Nikesh Arora": 1.2,
-    "Chris Malachowsky": 0.85,
-    "Jensen Huang (No Change)": 1.15,
-    "Johny Srouji": 1.15,
-    "Rene Haas": 1.15,
+    "Jay Puri": 0.78,
+    "Madison Huang": 0.78,
+    "Nikesh Arora": 1.33,
+    "Chris Malachowsky": 0.78,
+    "Jensen Huang (No Change)": 0.87,
+    "Johny Srouji": 1.33,
+    "Rene Haas": 1.33,
+    "Hock Tan": 0.78,
+    "Jonah Alben": 1.33,
+    "Lisa Su": 0.78,
+    "Michael Kagan": 1.33,
+    "Nico Caprez": 0.8,
+    "Pat Gelsinger": 0.78,
+    "Spencer Huang": 0.78,
+    "Tim Cook": 1.08,
+}
+REV_MULT = {
+    "Bill Dally": 1.5,
+    "Colette Kress": 0.4,
+    "Debora Shoquist": 1.5,
+    "Jensen Huang (No Change)": 0.6,
+    "Lisa Su": 0.5,
+    "Madison Huang": 0.5,
+    "Michael Kagan": 1.75,
+    "Rene Haas": 0.5,
+}
+MEDIAN_BIAS = {
+    "Colette Kress": -0.0025,
+    "Ian Buck": 0.0012,
+    "Jensen Huang (No Change)": -0.0025,
+    "Johny Srouji": 0.004,
+    "Lisa Su": -0.0012,
+    "Michael Kagan": 0.0012,
+    "Nikesh Arora": -0.004,
+    "Rene Haas": 0.004,
 }
 
 MEMBERS = (
@@ -368,6 +396,8 @@ def forecast_case(case):
         checkpoint = checkpoints[market_index]
         name = market.get("name") if isinstance(market, dict) else None
         offset_scale = MEDIAN_SCALES.get(name, 1.0)
+        reversion_multiplier = REV_MULT.get(name, 1.0)
+        median_bias = MEDIAN_BIAS.get(name, 0.0)
         sumrev_shift = (
             sumrev_base * checkpoint_weights[market_index] / checkpoint_weight_sum
             if checkpoint_weight_sum else 0.0
@@ -380,9 +410,10 @@ def forecast_case(case):
                 abs(raw[index] - raw[index - 90])
                 for index in range(90, len(raw))
             )
-            threshold = _linear_quantile(changes_90, 0.80)
+            threshold = _linear_quantile(changes_90, 0.75)
             if abs(reversion_move) >= threshold:
-                reversion_k = 0.5 if reversion_move > 0.0 else 0.25
+                reversion_k = (0.5 if reversion_move > 0.0 else 0.15)
+                reversion_k *= reversion_multiplier
 
         consecutive_differences = (
             abs(raw[index] - raw[index - 1])
@@ -404,7 +435,7 @@ def forecast_case(case):
                 -reversion_k * reversion_move *
                 math.sqrt((minute + 1) / HORIZON)
             )
-            shift = reversion_shift + sumrev_shift
+            shift = reversion_shift + sumrev_shift + median_bias
             row = []
             previous = 0.0
             for value in blended:
