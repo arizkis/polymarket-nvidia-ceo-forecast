@@ -16,8 +16,23 @@ STEPS = (4, 14, 31, 54, 84, 120, 163, 213)
 SQRT_STEPS = tuple(math.sqrt(step) for step in STEPS)
 VOL_FLOOR = 0.00015
 WEIGHT_HALF_LIFE = 720.0
+REGIME_HALF_LIFE = 0.5
+SUMREV_KAPPA = 0.0
 RECENCY_WEIGHTS = tuple(math.exp2(-age / WEIGHT_HALF_LIFE)
                         for age in range(4320))
+MEDIAN_SCALES = {
+    "Bill Dally": 1.2,
+    "Colette Kress": 0.85,
+    "Debora Shoquist": 1.2,
+    "Ian Buck": 1.25,
+    "Jay Puri": 1.1,
+    "Madison Huang": 1.25,
+    "Nikesh Arora": 1.2,
+    "Chris Malachowsky": 0.85,
+    "Jensen Huang (No Change)": 1.15,
+    "Johny Srouji": 1.15,
+    "Rene Haas": 1.15,
+}
 
 MEMBERS = (
     {
@@ -88,31 +103,62 @@ def _weighted_quantiles(samples):
     if not samples:
         return (0.0,) * len(TAUS)
     total_weight = sum(sample[1] for sample in samples)
-    first_u = 0.5 * samples[0][1] / total_weight
-    last_u = 1.0 - 0.5 * samples[-1][1] / total_weight
+    cumulative = 0.0
+    midpoints = []
+    for _, weight in samples:
+        cumulative += weight
+        midpoints.append((cumulative - 0.5 * weight) / total_weight)
+    values = [sample[0] for sample in samples]
     result = []
     for tau in TAUS:
-        if tau <= first_u:
-            result.append(samples[0][0])
-            continue
-        if tau >= last_u:
-            result.append(samples[-1][0])
-            continue
-        cumulative = 0.0
-        previous_value = samples[0][0]
-        previous_u = first_u
-        answer = samples[-1][0]
-        for value, weight in samples:
-            cumulative += weight
-            current_u = (cumulative - 0.5 * weight) / total_weight
-            if current_u >= tau:
-                fraction = (tau - previous_u) / (current_u - previous_u)
-                answer = previous_value + fraction * (value - previous_value)
-                break
-            previous_value = value
-            previous_u = current_u
-        result.append(answer)
+        upper = bisect.bisect_left(midpoints, tau)
+        if upper == 0:
+            result.append(values[0])
+        elif upper == len(values):
+            result.append(values[-1])
+        else:
+            fraction = ((tau - midpoints[upper - 1]) /
+                        (midpoints[upper] - midpoints[upper - 1]))
+            result.append(values[upper - 1] +
+                          fraction * (values[upper] - values[upper - 1]))
     return tuple(result)
+
+
+def _linear_quantile(sorted_values, tau):
+    if not sorted_values:
+        return 0.0
+    position = (len(sorted_values) - 1) * tau
+    lower = int(position)
+    fraction = position - lower
+    if lower + 1 == len(sorted_values):
+        return sorted_values[lower]
+    return sorted_values[lower] * (1.0 - fraction) + sorted_values[lower + 1] * fraction
+
+
+def _local_volatility(prices):
+    if len(prices) == 1:
+        return [1e-9]
+    changes = [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
+    squared_prefix = [0.0]
+    for change in changes:
+        squared_prefix.append(squared_prefix[-1] + change * change)
+    local = [0.0] * len(prices)
+    for index in range(1, len(prices)):
+        start = max(0, index - 60)
+        count = index - start
+        local[index] = math.sqrt(
+            (squared_prefix[index] - squared_prefix[start]) / count
+        )
+    local[0] = local[1]
+    return local
+
+
+def _regime_weight(local_vol, vol_now, start):
+    start = max(0, start)
+    return math.exp(
+        -abs(math.log((local_vol[start] + 1e-9) / (vol_now + 1e-9))) /
+        REGIME_HALF_LIFE
+    )
 
 
 def _tier(price):
@@ -125,7 +171,9 @@ def _tier(price):
 
 def _space_statistics(markets, space):
     pooled_samples = [[] for _ in STEPS]
+    pooled_regime_samples = [[] for _ in STEPS]
     market_stats = []
+    regime_market_stats = []
 
     for market in markets:
         raw_prices = _clean_prices(market.get("prices"))
@@ -154,10 +202,18 @@ def _space_statistics(markets, space):
             vol_weighted = VOL_FLOOR
 
         own_by_band = []
+        regime_own_by_band = []
+        local_vol = _local_volatility(prices) if space == "logit" else None
+        vol_now = local_vol[-1] if local_vol is not None else None
+        regime_factors = (
+            [_regime_weight(local_vol, vol_now, index) for index in range(count)]
+            if local_vol is not None else None
+        )
         for band_index, step in enumerate(STEPS):
             sample_count = count - step
             if sample_count <= 0:
                 own_by_band.append((0.0,) * len(TAUS))
+                regime_own_by_band.append((0.0,) * len(TAUS))
                 continue
             samples = []
             normalizer = vol_rms * math.sqrt(step)
@@ -165,30 +221,48 @@ def _space_statistics(markets, space):
                 age = count - 1 - (index + step)
                 weight = RECENCY_WEIGHTS[age] if age < len(RECENCY_WEIGHTS) else 0.0
                 delta = prices[index + step] - prices[index]
-                samples.append((delta, weight))
-            samples.sort()
-            own = _weighted_quantiles(samples)
+                if local_vol is not None:
+                    regime_weight = weight * regime_factors[index]
+                else:
+                    regime_weight = weight
+                samples.append((delta, weight, regime_weight))
+            samples.sort(key=lambda sample: sample[0])
+            weighted_samples = [(delta, weight) for delta, weight, _ in samples]
+            regime_samples = [(delta, weight) for delta, _, weight in samples]
+            own = _weighted_quantiles(weighted_samples)
+            regime_own = _weighted_quantiles(regime_samples)
             own_by_band.append(own)
+            regime_own_by_band.append(regime_own)
             center = own[2]
+            regime_center = regime_own[2]
             pooled_samples[band_index].extend(
                 ((delta - center) / normalizer, weight)
-                for delta, weight in samples
+                for delta, weight, _ in samples
+            )
+            pooled_regime_samples[band_index].extend(
+                ((delta - regime_center) / normalizer, weight)
+                for delta, _, weight in samples
             )
 
-        market_stats.append({
+        common_stats = {
             "id": market.get("id"),
             "price": checkpoint,
             "count": count,
             "vol_rms": vol_rms,
             "vol_weighted": vol_weighted,
-            "own": own_by_band,
-        })
+        }
+        market_stats.append(dict(common_stats, own=own_by_band))
+        regime_market_stats.append(dict(common_stats, own=regime_own_by_band))
 
     pooled_quantiles = []
-    for samples in pooled_samples:
-        samples.sort()
+    pooled_regime_quantiles = []
+    for samples, regime_samples in zip(pooled_samples, pooled_regime_samples):
+        samples.sort(key=lambda sample: sample[0])
+        regime_samples.sort(key=lambda sample: sample[0])
         pooled_quantiles.append(_weighted_quantiles(samples))
-    return market_stats, pooled_quantiles
+        pooled_regime_quantiles.append(_weighted_quantiles(regime_samples))
+    return (market_stats, pooled_quantiles,
+            regime_market_stats, pooled_regime_quantiles)
 
 
 def _member_forecasts(market_stats, pooled_quantiles, member, horizon):
@@ -257,19 +331,66 @@ def forecast_case(case):
     if not isinstance(horizon, int) or horizon < 1 or horizon > HORIZON:
         horizon = HORIZON
 
-    spaces = {}
-    for space in ("logit", "price"):
-        spaces[space] = _space_statistics(markets, space)
+    logit_stats = _space_statistics(markets, "logit")
+    price_stats = _space_statistics(markets, "price")
+    spaces = {
+        "logit": (logit_stats[0], logit_stats[1]),
+        "logit_regime": (logit_stats[2], logit_stats[3]),
+        "price": (price_stats[0], price_stats[1]),
+    }
 
     member_rows = []
-    for member in MEMBERS:
-        market_stats, pooled_quantiles = spaces[member["space"]]
+    for member_index, member in enumerate(MEMBERS):
+        space = "logit_regime" if member_index == 0 else member["space"]
+        market_stats, pooled_quantiles = spaces[space]
         member_rows.append(_member_forecasts(
             market_stats, pooled_quantiles, member, horizon
         ))
 
+    raw_prices = [
+        _clean_prices(market.get("prices")) if isinstance(market, dict) else [0.5]
+        for market in markets
+    ]
+    checkpoints = [prices[-1] for prices in raw_prices]
+    s0 = sum(checkpoints)
+    lag_sums = [0.0] * 1440
+    for prices in raw_prices:
+        for lag in range(1, min(1440, len(prices) - 1) + 1):
+            lag_sums[lag - 1] += prices[-1 - lag]
+    mean_lag_sum = sum(lag_sums) / len(lag_sums)
+    sumrev_base = -SUMREV_KAPPA * (s0 - mean_lag_sum)
+    checkpoint_weights = [price * (1.0 - price) for price in checkpoints]
+    checkpoint_weight_sum = sum(checkpoint_weights)
+
     forecasts = []
     for market_index, market in enumerate(markets):
+        raw = raw_prices[market_index]
+        checkpoint = checkpoints[market_index]
+        name = market.get("name") if isinstance(market, dict) else None
+        offset_scale = MEDIAN_SCALES.get(name, 1.0)
+        sumrev_shift = (
+            sumrev_base * checkpoint_weights[market_index] / checkpoint_weight_sum
+            if checkpoint_weight_sum else 0.0
+        )
+        reversion_move = 0.0
+        reversion_k = 0.0
+        if checkpoint > 0.10 and len(raw) > 90:
+            reversion_move = raw[-1] - raw[-91]
+            changes_90 = sorted(
+                abs(raw[index] - raw[index - 90])
+                for index in range(90, len(raw))
+            )
+            threshold = _linear_quantile(changes_90, 0.80)
+            if abs(reversion_move) >= threshold:
+                reversion_k = 0.5 if reversion_move > 0.0 else 0.25
+
+        consecutive_differences = (
+            abs(raw[index] - raw[index - 1])
+            for index in range(1, len(raw))
+        )
+        tick = min((difference for difference in consecutive_differences
+                    if difference > 0.0), default=0.0)
+
         rows = []
         for minute in range(horizon):
             blended = [
@@ -278,9 +399,18 @@ def forecast_case(case):
                     for member_index in range(len(MEMBERS)))
                 for quantile_index in range(len(TAUS))
             ]
+            median = blended[2]
+            reversion_shift = (
+                -reversion_k * reversion_move *
+                math.sqrt((minute + 1) / HORIZON)
+            )
+            shift = reversion_shift + sumrev_shift
             row = []
             previous = 0.0
             for value in blended:
+                value = median + shift + (value - median) * offset_scale
+                if tick > 0.0:
+                    value = round(value / tick) * tick
                 rounded = round(min(1.0, max(0.0, value)), 6)
                 rounded = max(previous, rounded)
                 row.append(rounded)
